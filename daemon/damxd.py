@@ -342,6 +342,12 @@ def watch_power():
                         # Nothing remembered for this state yet: keep what's on.
                         modes[source] = mode
                         save_modes(modes)
+                    # The other state starts as Balanced until the user picks
+                    # one, so the app never shows an empty choice.
+                    other = "battery" if source == "ac" else "ac"
+                    if other not in modes:
+                        modes[other] = "balanced"
+                        save_modes(modes)
                     elif wanted != mode and not held:
                         ppd_set_mode(wanted)
                         log.info("%s: switched to remembered mode %s", source, wanted)
