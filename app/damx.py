@@ -10,12 +10,15 @@ Where each setting goes:
     Acer hardware settings -> the damxd service through /run/damx.sock.
   - Automatic Power Saver   -> GNOME's own setting (gsettings), per user.
 
-Read-only info (battery, temperatures, fan RPM) comes straight from /sys,
-which any user may read.
+Read-only info (battery, CPU temperature, fan RPM) comes straight from /sys,
+which any user may read. The NVIDIA GPU's temperature comes from nvidia-smi,
+but only while the GPU is already awake - asking a sleeping GPU would wake it
+up and drain the battery.
 """
 
 import collections
 import glob
+import time
 import json
 import os
 import socket
@@ -56,6 +59,12 @@ LOW_BATTERY_MIN, LOW_BATTERY_MAX = 10, 50   # same limits as damxd
 
 REFRESH_SECONDS = 2
 HISTORY_POINTS = 30          # 30 x 2 s = the last minute in each mini-graph
+
+# Asking nvidia-smi for the temperature counts as GPU activity, and the GPU only
+# goes to sleep after ~10 s without any. So after NVIDIA_IDLE_READS readings
+# in a row at 0% load, we stop asking for NVIDIA_PAUSE_SECONDS to let it sleep.
+NVIDIA_IDLE_READS = 3
+NVIDIA_PAUSE_SECONDS = 20
 
 CSS = """
 .stat-card { padding: 10px 12px 8px 12px; }
@@ -108,6 +117,15 @@ def hwmon_dir(name):
     return None
 
 
+# PCI address of the NVIDIA GPU (lspci: 01:00.0). Its runtime_status is
+# "suspended" while the GPU sleeps.
+NVIDIA_PCI = "/sys/bus/pci/devices/0000:01:00.0"
+
+
+def nvidia_awake():
+    return read_file(os.path.join(NVIDIA_PCI, "power", "runtime_status")) == "active"
+
+
 def hwmon_file(name, file):
     d = hwmon_dir(name)
     return os.path.join(d, file) if d else None
@@ -139,11 +157,11 @@ class StatCard(Gtk.Button):
         value_box = Gtk.Box(spacing=4)
         self.value = Gtk.Label(label="–", xalign=0)
         self.value.add_css_class("stat-value")
-        unit_label = Gtk.Label(label=unit, valign=Gtk.Align.BASELINE_FILL, yalign=0.75)
-        unit_label.add_css_class("stat-unit")
-        unit_label.add_css_class("dim-label")
+        self.unit_label = Gtk.Label(label=unit, valign=Gtk.Align.BASELINE_FILL, yalign=0.75)
+        self.unit_label.add_css_class("stat-unit")
+        self.unit_label.add_css_class("dim-label")
         value_box.append(self.value)
-        value_box.append(unit_label)
+        value_box.append(self.unit_label)
 
         self.graph = Gtk.DrawingArea(content_height=30, margin_top=4)
         self.graph.set_draw_func(self.draw_graph)
@@ -153,9 +171,11 @@ class StatCard(Gtk.Button):
         box.append(self.graph)
         self.set_child(box)
 
-    def push(self, value):
-        """Add the newest reading (or None if unavailable)."""
-        self.value.set_label(f"{value}" if value is not None else "–")
+    def push(self, value, text=None):
+        """Add the newest reading (or None if unavailable).
+        text replaces the number (and hides the unit), e.g. "Asleep"."""
+        self.value.set_label(text or (f"{value}" if value is not None else "–"))
+        self.unit_label.set_visible(text is None)
         if value is not None:
             self.history.append(value)
         self.graph.queue_draw()
@@ -207,6 +227,8 @@ class DamxWindow(Adw.ApplicationWindow):
         self.low_battery_timer = None
         self.last_status = None
         self.scroll_animation = None
+        self.nvidia_idle_reads = 0
+        self.nvidia_pause_until = 0.0
 
         self.toasts = Adw.ToastOverlay()
         toolbar = Adw.ToolbarView()
@@ -225,10 +247,10 @@ class DamxWindow(Adw.ApplicationWindow):
         self.content.append(self.build_stats())
         self.power_group = self.build_power()
         self.content.append(self.power_group)
-        self.battery_group = self.build_battery()
-        self.content.append(self.battery_group)
         self.fans_group = self.build_fans()
         self.content.append(self.fans_group)
+        self.battery_group = self.build_battery()
+        self.content.append(self.battery_group)
         self.content.append(self.build_usb())
         self.content.append(self.build_keyboard())
         self.content.append(self.build_footer())
@@ -253,7 +275,7 @@ class DamxWindow(Adw.ApplicationWindow):
         to_power = lambda: self.scroll_to(self.power_group)      # noqa: E731
         self.battery_card = StatCard("Battery", "%", 5, lambda: self.scroll_to(self.battery_group))
         self.cpu_temp_card = StatCard("CPU", "°C", 10, to_power)
-        self.gpu_temp_card = StatCard("Radeon GPU", "°C", 10, to_power)
+        self.gpu_temp_card = StatCard("NVIDIA GPU", "°C", 10, lambda: self.scroll_to(self.fans_group))
         self.cpu_fan_card = StatCard("CPU Fan", "RPM", 600, lambda: self.scroll_to(self.fans_group))
         self.gpu_fan_card = StatCard("GPU Fan", "RPM", 600, lambda: self.scroll_to(self.fans_group))
         grid.attach(self.battery_card, 0, 0, 2, 1)
@@ -589,9 +611,44 @@ class DamxWindow(Adw.ApplicationWindow):
         self.battery_card.caption.set_label(f"Battery · {status}" if status else "Battery")
         self.battery_card.push(read_int("/sys/class/power_supply/BAT1/capacity"))
         self.cpu_temp_card.push(read_int(hwmon_file("k10temp", "temp1_input"), 1000))
-        self.gpu_temp_card.push(read_int(hwmon_file("amdgpu", "temp1_input"), 1000))
+        self.refresh_nvidia()
         self.cpu_fan_card.push(read_int(hwmon_file("acer", "fan1_input")))
         self.gpu_fan_card.push(read_int(hwmon_file("acer", "fan2_input")))
+
+    def refresh_nvidia(self):
+        if not nvidia_awake():
+            self.gpu_temp_card.caption.set_label("NVIDIA GPU")
+            self.gpu_temp_card.push(None, text="Asleep")
+            self.nvidia_idle_reads = 0
+            return
+        if time.monotonic() < self.nvidia_pause_until:
+            # Idle and we're leaving it alone so it can sleep; keep the last number.
+            self.gpu_temp_card.caption.set_label("NVIDIA GPU · Idle")
+            return
+        try:
+            proc = Gio.Subprocess.new(
+                ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error:
+            self.gpu_temp_card.push(None)
+            return
+        proc.communicate_utf8_async(None, None, self.on_nvidia_reply)
+
+    def on_nvidia_reply(self, proc, result):
+        try:
+            _ok, out, _err = proc.communicate_utf8_finish(result)
+            temp, load = (int(x) for x in out.strip().split(","))
+        except (GLib.Error, ValueError, AttributeError):
+            self.gpu_temp_card.caption.set_label("NVIDIA GPU")
+            self.gpu_temp_card.push(None)
+            return
+        self.gpu_temp_card.caption.set_label(f"NVIDIA GPU · {load}% load")
+        self.gpu_temp_card.push(temp)
+        self.nvidia_idle_reads = self.nvidia_idle_reads + 1 if load == 0 else 0
+        if self.nvidia_idle_reads >= NVIDIA_IDLE_READS:
+            self.nvidia_pause_until = time.monotonic() + NVIDIA_PAUSE_SECONDS
+            self.nvidia_idle_reads = 0
 
     def show_status(self, status):
         s = status["settings"]

@@ -22,8 +22,14 @@ Three parts:
 - `app/damx.py` — GTK4 + libadwaita (Python, PyGObject) app, id
   `io.github.anbu05.DAMX`, installed as `/usr/bin/damx`. Top: clickable stat
   cards (battery, CPU temp, Radeon iGPU temp, CPU/GPU fan RPM) with 1-minute
-  mini-graphs; clicking scrolls to the matching section. NVIDIA temp is
-  deliberately not read (would wake the dGPU).
+  mini-graphs; clicking scrolls to the matching section. Section order:
+  Power Mode, Fans, Battery, USB, Keyboard.
+- NVIDIA card: temp/load via `nvidia-smi`, only while
+  `/sys/bus/pci/devices/0000:01:00.0/power/runtime_status` is `active` (never
+  wakes a sleeping GPU; shows "Asleep"). Each nvidia-smi call counts as GPU
+  activity and the GPU sleeps only after ~10 s idle, so polling every 2 s kept
+  it awake forever (measured). Fix: after 3 reads at 0% load the app stops
+  asking for 20 s. Measured: GPU sleeps within ~30 s with the app open.
 
 ## Build / run / test
 - Install or update: `sudo ./install.sh` (also removes the original DAMX 1.0.2).
