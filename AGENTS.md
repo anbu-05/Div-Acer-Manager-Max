@@ -56,10 +56,13 @@ Three parts:
   branch (still in git history and on `main`).
 
 ## Known issues / not yet verified
-- Not yet installed on the laptop; needs `sudo ./install.sh` run by the user.
-- Unverified on real hardware: PPD picking up the patched driver
-  (`powerprofilesctl list` should show `PlatformDriver: platform_profile`),
-  Performance-on-battery fallback, Nitro key really sending 425, restore at boot.
+- Installed 2026-11-26. Verified: DKMS install for 7.0.0-44, PPD shows
+  `PlatformDriver: platform_profile`, GNOME modes map to firmware
+  (power-saver→low-power, balanced→balanced, performance→performance),
+  damxd running and saved the current settings on first run.
+- Still unverified: app on the real desktop, Nitro key really sending 425,
+  restore at boot, Performance-on-battery fallback and re-apply on plug-in,
+  automatic DKMS rebuild on the next kernel update.
 - The driver's mode-cycling key can put the firmware in Quiet, which isn't one
   of GNOME's three modes.
 - The `damxfix` alias (`~/.bash_aliases`, see `~/modifications/damxfix-alias/`)
