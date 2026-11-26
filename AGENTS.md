@@ -12,11 +12,18 @@ Three parts:
   (commit in `driver/UPSTREAM_COMMIT`), installed via DKMS as
   `linuwu-sense/25.701-nitro1`. Our changes are marked `DAMX-nitro-gnome`.
 - `daemon/damxd.py` — root systemd service `damxd.service`. Saves and restores
-  settings in `/var/lib/damx/settings.json`; socket `/run/damx.sock`
-  (root:linuwu_sense 0660, JSON lines: `status`, `set`, `calibrate`); re-applies
-  the power mode when the charger is plugged in; launches the app on the Nitro key.
+  settings in `/var/lib/damx/settings.json`; remembers one power mode for
+  plugged in and one for battery (`/var/lib/damx/power-modes.json`) and switches
+  PPD between them; edits `PercentageLow` in `/etc/UPower/UPower.conf`
+  (original kept as `UPower.conf.damx-orig`, restarts upower); socket
+  `/run/damx.sock` (root:linuwu_sense 0660, JSON lines: `status`, `set`,
+  `calibrate`, `set_power_mode`, `set_low_battery`); launches the app on the
+  Nitro key.
 - `app/damx.py` — GTK4 + libadwaita (Python, PyGObject) app, id
-  `io.github.anbu05.DAMX`, installed as `/usr/bin/damx`.
+  `io.github.anbu05.DAMX`, installed as `/usr/bin/damx`. Top: clickable stat
+  cards (battery, CPU temp, Radeon iGPU temp, CPU/GPU fan RPM) with 1-minute
+  mini-graphs; clicking scrolls to the matching section. NVIDIA temp is
+  deliberately not read (would wake the dGPU).
 
 ## Build / run / test
 - Install or update: `sudo ./install.sh` (also removes the original DAMX 1.0.2).
@@ -24,16 +31,19 @@ Three parts:
 - Compile-test the driver without installing: copy `driver/Makefile` and
   `driver/src` to a temp folder, then `make` (builds for the running kernel).
 - UI test without hardware: run damxd's functions against a fake sysfs folder
-  (override `NITRO_DIR`, `STATE_DIR`, `SOCKET_PATH`), start the app with
+  (override `NITRO_DIR`, `STATE_DIR`, `STATE_FILE`, `MODES_FILE`,
+  `UPOWER_CONF`, `SOCKET_PATH`; stub `os.chown` and `subprocess.run`; keep the
+  socket path short, AF_UNIX limit), start the app with
   `DAMX_SOCKET=<fake socket>`. To see it in a browser:
   `gtk4-broadwayd :5`, then `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`, open
   http://127.0.0.1:8085. Careful: the power mode buttons still change the
-  REAL power mode through power-profiles-daemon.
+  REAL power mode through power-profiles-daemon, and `set_power_mode` for the
+  current charger state does too.
 
 ## Decisions in force
-- GNOME's power-profiles-daemon (PPD) owns the power mode. It remembers the mode
-  across reboots by itself. Neither damxd nor the app writes `platform_profile`
-  directly, except damxd re-writing the same value when the charger is plugged in.
+- GNOME's power-profiles-daemon (PPD) owns the power mode. Neither damxd nor the
+  app writes `platform_profile` directly, except damxd re-writing the same value
+  when the charger is plugged in.
 - Driver patch 1: the firmware has eco/quiet/balanced/performance but no turbo
   (bitmap 0x53). Upstream reported firmware PERFORMANCE as `balanced-performance`,
   so PPD (which needs `performance`) fell back to "placeholder" and only
@@ -43,7 +53,16 @@ Three parts:
   returning an error, the driver runs BALANCED and remembers the request
   (`requested_on_battery`); reading the profile shows the request until the
   firmware mode changes. damxd re-applies it on AC plug-in.
-- No automatic mode switching on AC/battery (user's choice, for now).
+- Per-charger modes (user chose this 2026-11-26): damxd polls every 2 s. On a
+  charger change (and at boot) it sets PPD to the remembered mode for the new
+  state; any other mode change is remembered for the current state. While PPD
+  has an ActiveProfileHold (GNOME's automatic low-battery Power Saver) it
+  neither remembers nor overrides, so the low-battery switch never overwrites
+  the battery choice.
+- Low-battery level range in the app: 10–50% (must stay above
+  PercentageCritical=5). It also moves GNOME's low-battery warning. The
+  Automatic Power Saver switch in the app is bound to GNOME's own gsettings key
+  `power-saver-profile-on-low-battery`.
 - Remembered settings: battery_limiter, fan_speed, usb_charging,
   backlight_timeout. Battery calibration is deliberately not remembered
   (it's a one-off multi-hour process).
@@ -60,9 +79,11 @@ Three parts:
   `PlatformDriver: platform_profile`, GNOME modes map to firmware
   (power-saver→low-power, balanced→balanced, performance→performance),
   damxd running and saved the current settings on first run.
-- Still unverified: app on the real desktop, Nitro key really sending 425,
-  restore at boot, Performance-on-battery fallback and re-apply on plug-in,
-  automatic DKMS rebuild on the next kernel update.
+- User confirmed 2026-11-26: app, Nitro key, restore at boot and
+  Performance-on-battery all work.
+- Still unverified: per-charger mode switching and the low-battery level on
+  real hardware (tested only against a fake service), automatic DKMS rebuild
+  on the next kernel update.
 - The driver's mode-cycling key can put the firmware in Quiet, which isn't one
   of GNOME's three modes.
 - The `damxfix` alias (`~/.bash_aliases`, see `~/modifications/damxfix-alias/`)

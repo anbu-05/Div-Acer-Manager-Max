@@ -10,7 +10,7 @@ rebuilt for one laptop: an **Acer Nitro ANV15-41 on Ubuntu with GNOME**.
 | Driver breaks after every kernel update | Driver is installed with **DKMS**, so it rebuilds itself automatically |
 | GNOME's power menu and DAMX fight over the power mode | The driver now offers the modes GNOME expects, so **GNOME's power menu controls the Acer firmware modes**. The app uses the same switch. |
 | Settings are forgotten after a reboot | `damxd` **remembers** battery limit, fans, USB charging and keyboard timeout and restores them at boot. GNOME remembers the power mode. |
-| Switches modes on its own when the charger is plugged in or out | No automatic switching. Performance picked on battery runs as Balanced until you plug in, then switches to Performance (the firmware doesn't allow Performance on battery). |
+| Switches modes on its own, and forgets your choice | Remembers **one mode for plugged in and one for battery** and switches between them; GNOME's low-battery Power Saver never overwrites them |
 | 100 MB .NET app | Small GTK4/libadwaita app that looks like the rest of GNOME |
 
 ## Layout

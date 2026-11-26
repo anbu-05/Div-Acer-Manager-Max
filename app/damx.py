@@ -3,16 +3,18 @@
 DAMX - settings app for the Acer Nitro ANV15-41 (GTK4 + libadwaita).
 
 Where each setting goes:
-  - Power mode     -> GNOME's power-profiles-daemon over D-Bus. This is the
-                      same switch as the power menu in the top bar, so the two
-                      can never disagree.
-  - Everything else -> the damxd service through /run/damx.sock. damxd writes
-                      the hardware and remembers the value for the next boot.
+  - Power mode right now -> GNOME's power-profiles-daemon over D-Bus. This is
+                            the same switch as the power menu in the top bar,
+                            so the two can never disagree.
+  - Remembered modes (plugged in / on battery), battery low level, and the
+    Acer hardware settings -> the damxd service through /run/damx.sock.
+  - Automatic Power Saver   -> GNOME's own setting (gsettings), per user.
 
-Read-only info (battery %, CPU temperature, fan RPM) comes straight from
-/sys, which any user may read.
+Read-only info (battery, temperatures, fan RPM) comes straight from /sys,
+which any user may read.
 """
 
+import collections
 import glob
 import json
 import os
@@ -23,7 +25,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
 
 APP_ID = "io.github.anbu05.DAMX"
 # DAMX_SOCKET lets the test harness point the app at a fake service.
@@ -33,24 +36,33 @@ PPD_NAME = "org.freedesktop.UPower.PowerProfiles"
 PPD_PATH = "/org/freedesktop/UPower/PowerProfiles"
 PPD_IFACE = "org.freedesktop.UPower.PowerProfiles"
 
+# GNOME's "switch to Power Saver when the battery is low" setting.
+GNOME_POWER_SCHEMA = "org.gnome.settings-daemon.plugins.power"
+GNOME_AUTO_SAVER_KEY = "power-saver-profile-on-low-battery"
+
 # (power-profiles-daemon name, label, icon)
 POWER_MODES = [
     ("power-saver", "Power Saver", "power-profile-power-saver-symbolic"),
     ("balanced", "Balanced", "power-profile-balanced-symbolic"),
     ("performance", "Performance", "power-profile-performance-symbolic"),
 ]
+MODE_NAMES = [name for name, _, _ in POWER_MODES]
 
 # usb_charging values: keep USB ports powered while the laptop is off,
 # until the battery drops to this level. 0 = off.
-USB_CHOICES = [("0", "Off"), ("10", "Down to 10%"),
-               ("20", "Down to 20%"), ("30", "Down to 30%")]
+USB_CHOICES = [("0", "Off"), ("10", "10%"), ("20", "20%"), ("30", "30%")]
+
+LOW_BATTERY_MIN, LOW_BATTERY_MAX = 10, 50   # same limits as damxd
 
 REFRESH_SECONDS = 2
+HISTORY_POINTS = 30          # 30 x 2 s = the last minute in each mini-graph
 
 CSS = """
-.stat-card { padding: 14px 8px; }
-.stat-value { font-size: 1.6em; font-weight: 800; font-feature-settings: "tnum"; }
+.stat-card { padding: 10px 12px 8px 12px; }
+.stat-value { font-size: 1.5em; font-weight: 800; font-feature-settings: "tnum"; }
+.stat-unit { font-size: 0.85em; font-weight: 600; }
 .mode-note { margin-top: 6px; }
+.mode-memory { margin-top: 12px; }
 """
 
 
@@ -59,7 +71,7 @@ CSS = """
 def damxd_request(request):
     """Send one request to damxd and return its reply (or raise OSError)."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(3)
+        s.settimeout(5)
         s.connect(SOCKET_PATH)
         s.sendall((json.dumps(request) + "\n").encode())
         data = b""
@@ -81,6 +93,14 @@ def read_file(path):
         return None
 
 
+def read_int(path, divide=1):
+    value = read_file(path) if path else None
+    try:
+        return int(value) // divide
+    except (TypeError, ValueError):
+        return None
+
+
 def hwmon_dir(name):
     for d in glob.glob("/sys/class/hwmon/hwmon*"):
         if read_file(os.path.join(d, "name")) == name:
@@ -88,31 +108,105 @@ def hwmon_dir(name):
     return None
 
 
-def read_sensors():
-    """Battery %, battery status, CPU temp in °C, (cpu_rpm, gpu_rpm)."""
-    battery = read_file("/sys/class/power_supply/BAT1/capacity")
-    status = read_file("/sys/class/power_supply/BAT1/status")
-    cpu = hwmon_dir("k10temp")
-    temp = read_file(os.path.join(cpu, "temp1_input")) if cpu else None
-    acer = hwmon_dir("acer")
-    fans = (read_file(os.path.join(acer, "fan1_input")) if acer else None,
-            read_file(os.path.join(acer, "fan2_input")) if acer else None)
-    return battery, status, (int(temp) // 1000 if temp else None), fans
+def hwmon_file(name, file):
+    d = hwmon_dir(name)
+    return os.path.join(d, file) if d else None
 
 
-# --- UI ------------------------------------------------------------------------
+# --- Stat card with a live mini-graph ------------------------------------
+
+class StatCard(Gtk.Button):
+    """A clickable card: caption, big number, and a graph of the last minute.
+
+    span_min: the graph's vertical range never gets smaller than this, so
+    a fan wobbling by 20 RPM doesn't look like a huge swing.
+    """
+
+    def __init__(self, caption, unit, span_min, on_click):
+        super().__init__(hexpand=True)
+        self.add_css_class("card")
+        self.add_css_class("stat-card")
+        self.unit = unit
+        self.span_min = span_min
+        self.history = collections.deque(maxlen=HISTORY_POINTS)
+        self.connect("clicked", lambda _b: on_click())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.caption = Gtk.Label(label=caption, xalign=0)
+        self.caption.add_css_class("caption")
+        self.caption.add_css_class("dim-label")
+
+        value_box = Gtk.Box(spacing=4)
+        self.value = Gtk.Label(label="–", xalign=0)
+        self.value.add_css_class("stat-value")
+        unit_label = Gtk.Label(label=unit, valign=Gtk.Align.BASELINE_FILL, yalign=0.75)
+        unit_label.add_css_class("stat-unit")
+        unit_label.add_css_class("dim-label")
+        value_box.append(self.value)
+        value_box.append(unit_label)
+
+        self.graph = Gtk.DrawingArea(content_height=30, margin_top=4)
+        self.graph.set_draw_func(self.draw_graph)
+
+        box.append(self.caption)
+        box.append(value_box)
+        box.append(self.graph)
+        self.set_child(box)
+
+    def push(self, value):
+        """Add the newest reading (or None if unavailable)."""
+        self.value.set_label(f"{value}" if value is not None else "–")
+        if value is not None:
+            self.history.append(value)
+        self.graph.queue_draw()
+
+    def draw_graph(self, _area, cr, width, height):
+        points = list(self.history)
+        if len(points) < 2:
+            return
+        lo, hi = min(points), max(points)
+        if hi - lo < self.span_min:      # keep a minimum range, centred
+            mid = (hi + lo) / 2
+            lo, hi = mid - self.span_min / 2, mid + self.span_min / 2
+        step = width / (HISTORY_POINTS - 1)
+        # Newest point sits at the right edge.
+        x0 = width - step * (len(points) - 1)
+
+        def xy(i, v):
+            return x0 + i * step, height - 2 - (v - lo) / (hi - lo) * (height - 4)
+
+        color = Adw.StyleManager.get_default().get_accent_color_rgba()
+        # Soft fill under the line...
+        cr.move_to(x0, height)
+        for i, v in enumerate(points):
+            cr.line_to(*xy(i, v))
+        cr.line_to(width, height)
+        cr.close_path()
+        cr.set_source_rgba(color.red, color.green, color.blue, 0.15)
+        cr.fill()
+        # ...and the line itself.
+        for i, v in enumerate(points):
+            cr.line_to(*xy(i, v)) if i else cr.move_to(*xy(i, v))
+        cr.set_source_rgba(color.red, color.green, color.blue, 1)
+        cr.set_line_width(2)
+        cr.stroke()
+
+
+# --- Main window -------------------------------------------------------------
 
 class DamxWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="DAMX")
-        self.set_default_size(480, 760)
+        self.set_default_size(520, 820)
         self.set_size_request(360, 400)
 
         # True while we copy hardware state into the widgets, so the widgets'
         # "changed" signals don't send the same value straight back.
         self.updating = False
         self.fan_timer = None
+        self.low_battery_timer = None
         self.last_status = None
+        self.scroll_animation = None
 
         self.toasts = Adw.ToastOverlay()
         toolbar = Adw.ToolbarView()
@@ -124,16 +218,25 @@ class DamxWindow(Adw.ApplicationWindow):
         self.banner = Adw.Banner(title="The DAMX service isn't running — hardware settings are unavailable")
         toolbar.add_top_bar(self.banner)
 
-        page = Adw.PreferencesPage()
-        page.add(self.build_stats())
-        page.add(self.build_power())
-        page.add(self.build_battery())
-        page.add(self.build_fans())
-        page.add(self.build_usb())
-        page.add(self.build_keyboard())
-        page.add(self.build_footer())
+        # Our own scrolled page (instead of Adw.PreferencesPage) so the stat
+        # cards can scroll to a section when clicked.
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24,
+                               margin_top=18, margin_bottom=24, margin_start=12, margin_end=12)
+        self.content.append(self.build_stats())
+        self.power_group = self.build_power()
+        self.content.append(self.power_group)
+        self.battery_group = self.build_battery()
+        self.content.append(self.battery_group)
+        self.fans_group = self.build_fans()
+        self.content.append(self.fans_group)
+        self.content.append(self.build_usb())
+        self.content.append(self.build_keyboard())
+        self.content.append(self.build_footer())
 
-        toolbar.set_content(page)
+        self.scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        self.scroller.set_child(Adw.Clamp(maximum_size=640, child=self.content))
+
+        toolbar.set_content(self.scroller)
         self.toasts.set_child(toolbar)
         self.set_content(self.toasts)
 
@@ -143,30 +246,22 @@ class DamxWindow(Adw.ApplicationWindow):
 
     # ----- building the sections -----
 
-    def stat_card(self, title):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        box.add_css_class("card")
-        box.add_css_class("stat-card")
-        value = Gtk.Label(label="–")
-        value.add_css_class("stat-value")
-        caption = Gtk.Label(label=title)
-        caption.add_css_class("caption")
-        caption.add_css_class("dim-label")
-        box.append(value)
-        box.append(caption)
-        return box, value, caption
-
     def build_stats(self):
-        group = Adw.PreferencesGroup()
-        row = Gtk.Box(spacing=10, homogeneous=True)
-        card, self.battery_value, self.battery_caption = self.stat_card("Battery")
-        row.append(card)
-        card, self.temp_value, _ = self.stat_card("CPU")
-        row.append(card)
-        card, self.fan_value, _ = self.stat_card("Fans (CPU / GPU)")
-        row.append(card)
-        group.add(row)
-        return group
+        # 6-column grid: top row 3 cards (2 columns each), bottom row the
+        # two fans (3 columns each), so there's never a gap.
+        grid = Gtk.Grid(column_homogeneous=True, column_spacing=10, row_spacing=10)
+        to_power = lambda: self.scroll_to(self.power_group)      # noqa: E731
+        self.battery_card = StatCard("Battery", "%", 5, lambda: self.scroll_to(self.battery_group))
+        self.cpu_temp_card = StatCard("CPU", "°C", 10, to_power)
+        self.gpu_temp_card = StatCard("Radeon GPU", "°C", 10, to_power)
+        self.cpu_fan_card = StatCard("CPU Fan", "RPM", 600, lambda: self.scroll_to(self.fans_group))
+        self.gpu_fan_card = StatCard("GPU Fan", "RPM", 600, lambda: self.scroll_to(self.fans_group))
+        grid.attach(self.battery_card, 0, 0, 2, 1)
+        grid.attach(self.cpu_temp_card, 2, 0, 2, 1)
+        grid.attach(self.gpu_temp_card, 4, 0, 2, 1)
+        grid.attach(self.cpu_fan_card, 0, 1, 3, 1)
+        grid.attach(self.gpu_fan_card, 3, 1, 3, 1)
+        return grid
 
     def build_power(self):
         group = Adw.PreferencesGroup(
@@ -186,6 +281,22 @@ class DamxWindow(Adw.ApplicationWindow):
         self.mode_note.add_css_class("dim-label")
         self.mode_note.add_css_class("mode-note")
         group.add(self.mode_note)
+
+        # The two remembered modes. damxd switches between them when the
+        # charger is plugged in / pulled out.
+        memory = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        memory.add_css_class("boxed-list")
+        memory.add_css_class("mode-memory")
+        labels = Gtk.StringList.new([label for _, label, _ in POWER_MODES])
+        self.ac_mode_row = Adw.ComboRow(title="When Plugged In", model=labels)
+        self.ac_mode_row.add_prefix(Gtk.Image(icon_name="ac-adapter-symbolic"))
+        self.battery_mode_row = Adw.ComboRow(title="On Battery", model=labels)
+        self.battery_mode_row.add_prefix(Gtk.Image(icon_name="battery-symbolic"))
+        self.ac_mode_row.connect("notify::selected", self.on_remembered_mode_changed, "ac")
+        self.battery_mode_row.connect("notify::selected", self.on_remembered_mode_changed, "battery")
+        memory.append(self.ac_mode_row)
+        memory.append(self.battery_mode_row)
+        group.add(memory)
         return group
 
     def build_battery(self):
@@ -195,6 +306,25 @@ class DamxWindow(Adw.ApplicationWindow):
             subtitle="Helps the battery last longer if the laptop is mostly plugged in")
         self.limit_row.connect("notify::active", self.on_limit_changed)
         group.add(self.limit_row)
+
+        # GNOME's own setting; bound directly, so it always matches Settings → Power.
+        self.auto_saver_row = Adw.SwitchRow(
+            title="Automatic Power Saver",
+            subtitle="Switch to Power Saver when the battery is low")
+        schema = Gio.SettingsSchemaSource.get_default().lookup(GNOME_POWER_SCHEMA, True)
+        if schema and schema.has_key(GNOME_AUTO_SAVER_KEY):
+            self.gnome_power = Gio.Settings.new(GNOME_POWER_SCHEMA)
+            self.gnome_power.bind(GNOME_AUTO_SAVER_KEY, self.auto_saver_row, "active",
+                                  Gio.SettingsBindFlags.DEFAULT)
+        else:
+            self.auto_saver_row.set_sensitive(False)
+        group.add(self.auto_saver_row)
+
+        self.low_battery_row = Adw.SpinRow.new_with_range(LOW_BATTERY_MIN, LOW_BATTERY_MAX, 1)
+        self.low_battery_row.set_title("Battery Low At")
+        self.low_battery_row.set_subtitle("Power Saver and GNOME's low-battery warning start at this level (%)")
+        self.low_battery_row.connect("notify::value", self.on_low_battery_changed)
+        group.add(self.low_battery_row)
 
         self.calib_row = Adw.ActionRow(
             title="Calibrate Battery",
@@ -239,7 +369,7 @@ class DamxWindow(Adw.ApplicationWindow):
         group = Adw.PreferencesGroup(title="USB Charging")
         self.usb_row = Adw.ComboRow(
             title="Power USB Ports When Off",
-            subtitle="Keeps charging your phone after shutdown, until the battery drops to this level",
+            subtitle="Keeps charging devices after shutdown until the battery drops to this level",
             model=Gtk.StringList.new([label for _, label in USB_CHOICES]))
         self.usb_row.connect("notify::selected", self.on_usb_changed)
         group.add(self.usb_row)
@@ -255,14 +385,27 @@ class DamxWindow(Adw.ApplicationWindow):
         return group
 
     def build_footer(self):
-        group = Adw.PreferencesGroup()
         self.footer = Gtk.Label(label="", wrap=True, justify=Gtk.Justification.CENTER)
         self.footer.add_css_class("caption")
         self.footer.add_css_class("dim-label")
-        group.add(self.footer)
-        return group
+        return self.footer
 
-    # ----- power-profiles-daemon (power mode) -----
+    # ----- clicking a card scrolls to its section -----
+
+    def scroll_to(self, widget):
+        ok, point = widget.compute_point(self.content, Graphene.Point())
+        if not ok:
+            return
+        adj = self.scroller.get_vadjustment()
+        target = min(point.y - 12, adj.get_upper() - adj.get_page_size())
+        if self.scroll_animation:
+            self.scroll_animation.skip()
+        self.scroll_animation = Adw.TimedAnimation.new(
+            self.scroller, adj.get_value(), max(0, target), 350,
+            Adw.PropertyAnimationTarget.new(adj, "value"))
+        self.scroll_animation.play()
+
+    # ----- power-profiles-daemon (power mode right now) -----
 
     def connect_power_profiles(self):
         try:
@@ -289,6 +432,7 @@ class DamxWindow(Adw.ApplicationWindow):
     def on_mode_changed(self, toggles, _pspec):
         if self.updating or not self.ppd:
             return
+        # damxd notices the change and remembers it for plugged in / battery.
         name = toggles.get_active_name()
         self.ppd.call(
             "org.freedesktop.DBus.Properties.Set",
@@ -302,10 +446,28 @@ class DamxWindow(Adw.ApplicationWindow):
             self.toast(f"Couldn't change power mode: {e.message}")
             self.show_power_mode()
         self.update_mode_note()
+        # damxd checks every 2 s; refresh a bit later to show what it remembered.
+        GLib.timeout_add(2500, self.refresh_once)
+
+    def refresh_once(self):
+        self.refresh()
+        return GLib.SOURCE_REMOVE
 
     def update_mode_note(self):
         on_ac = self.last_status.get("on_ac", True) if self.last_status else True
         self.mode_note.set_visible(not on_ac and self.mode_toggles.get_active_name() == "performance")
+
+    def on_remembered_mode_changed(self, row, _pspec, source):
+        if self.updating:
+            return
+        mode = MODE_NAMES[row.get_selected()]
+        try:
+            reply = damxd_request({"cmd": "set_power_mode", "source": source, "mode": mode})
+            if not reply.get("ok"):
+                self.toast(f"Couldn't save mode: {reply.get('error')}")
+        except OSError as e:
+            self.toast(f"Couldn't save mode: {e}")
+        self.refresh()
 
     # ----- damxd settings -----
 
@@ -330,6 +492,28 @@ class DamxWindow(Adw.ApplicationWindow):
     def on_usb_changed(self, row, _pspec):
         if not self.updating:
             self.set_setting("usb_charging", USB_CHOICES[row.get_selected()][0])
+
+    def on_low_battery_changed(self, _row, _pspec):
+        if self.updating:
+            return
+        # damxd restarts UPower for this, so wait until the value settles.
+        if self.low_battery_timer:
+            GLib.source_remove(self.low_battery_timer)
+        self.low_battery_timer = GLib.timeout_add(800, self.send_low_battery)
+
+    def send_low_battery(self):
+        self.low_battery_timer = None
+        percent = int(self.low_battery_row.get_value())
+        try:
+            reply = damxd_request({"cmd": "set_low_battery", "percent": percent})
+            if reply.get("ok"):
+                self.toast(f"Battery low level set to {percent}%")
+            else:
+                self.toast(f"Couldn't change it: {reply.get('error')}")
+        except OSError as e:
+            self.toast(f"Couldn't change it: {e}")
+        self.refresh()
+        return GLib.SOURCE_REMOVE
 
     def on_fan_mode_changed(self, toggles, _pspec):
         mode = toggles.get_active_name()
@@ -391,8 +575,9 @@ class DamxWindow(Adw.ApplicationWindow):
         except (OSError, ValueError):
             status = None
         self.banner.set_revealed(status is None)
-        for widget in (self.limit_row, self.calib_row, self.fan_toggles,
-                       self.custom_box, self.usb_row, self.backlight_row):
+        for widget in (self.limit_row, self.calib_row, self.fan_toggles, self.custom_box,
+                       self.usb_row, self.backlight_row, self.ac_mode_row,
+                       self.battery_mode_row, self.low_battery_row):
             widget.set_sensitive(status is not None)
         if status:
             self.last_status = status
@@ -400,14 +585,13 @@ class DamxWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_CONTINUE
 
     def refresh_sensors(self):
-        battery, bat_status, temp, (cpu_rpm, gpu_rpm) = read_sensors()
-        self.battery_value.set_label(f"{battery}%" if battery else "–")
-        self.battery_caption.set_label(f"Battery · {bat_status}" if bat_status else "Battery")
-        self.temp_value.set_label(f"{temp}°C" if temp is not None else "–")
-        if cpu_rpm is not None:
-            self.fan_value.set_label(f"{int(cpu_rpm) // 100 / 10:g}k / {int(gpu_rpm or 0) // 100 / 10:g}k")
-        else:
-            self.fan_value.set_label("–")
+        status = read_file("/sys/class/power_supply/BAT1/status")
+        self.battery_card.caption.set_label(f"Battery · {status}" if status else "Battery")
+        self.battery_card.push(read_int("/sys/class/power_supply/BAT1/capacity"))
+        self.cpu_temp_card.push(read_int(hwmon_file("k10temp", "temp1_input"), 1000))
+        self.gpu_temp_card.push(read_int(hwmon_file("amdgpu", "temp1_input"), 1000))
+        self.cpu_fan_card.push(read_int(hwmon_file("acer", "fan1_input")))
+        self.gpu_fan_card.push(read_int(hwmon_file("acer", "fan2_input")))
 
     def show_status(self, status):
         s = status["settings"]
@@ -432,6 +616,17 @@ class DamxWindow(Adw.ApplicationWindow):
                     self.cpu_scale.set_value(cpu)
                     self.gpu_scale.set_value(gpu)
             self.custom_box.set_visible(self.fan_toggles.get_active_name() == "custom")
+
+            # Remembered modes; mark which one is in use right now.
+            modes = status.get("power_modes") or {}
+            on_ac = status.get("on_ac", True)
+            for row, source in ((self.ac_mode_row, "ac"), (self.battery_mode_row, "battery")):
+                if modes.get(source) in MODE_NAMES:
+                    row.set_selected(MODE_NAMES.index(modes[source]))
+                row.set_subtitle("In use now" if (source == "ac") == on_ac else "")
+
+            if status.get("low_battery") is not None and not self.low_battery_timer:
+                self.low_battery_row.set_value(status["low_battery"])
 
             calibrating = status.get("battery_calibration") == "1"
             self.calib_button.set_label("Stop" if calibrating else "Start")
