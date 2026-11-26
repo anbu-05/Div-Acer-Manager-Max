@@ -1,0 +1,14 @@
+[Unit]
+Description=DAMX service for the Acer Nitro (remembers settings, Nitro key)
+# Needs the driver loaded and GNOME's power-profiles-daemon around.
+After=systemd-modules-load.service power-profiles-daemon.service
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/damx/damxd.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

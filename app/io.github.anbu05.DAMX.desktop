@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DAMX
+GenericName=Laptop Settings
+Comment=Battery limit, fans and power mode for the Acer Nitro
+Exec=damx
+Icon=io.github.anbu05.DAMX
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=acer;nitro;fan;battery;power;
+StartupNotify=true

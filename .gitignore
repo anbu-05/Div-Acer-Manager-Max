@@ -1,18 +1,14 @@
+# Python
+__pycache__/
+*.pyc
 
-DivAcerManagerMax/obj/
-
-DivAcerManagerMax/bin/Release/net9.0/linux-x64/
-
-DivAcerManagerMax/bin/Debug/net9.0/
-
-Publish/
-
-publish/
-
-buildPublish/
-
-DAMM-Daemon/build/
-
-DAMM-Daemon/dist/
-
-DAMM-Daemon/__pycache__/
+# Kernel module build output (when compiling the driver by hand)
+driver/src/*.o
+driver/src/*.ko
+driver/src/*.mod
+driver/src/*.mod.c
+driver/src/.*.cmd
+driver/.*.cmd
+driver/.module-common.o
+driver/Module.symvers
+driver/modules.order
