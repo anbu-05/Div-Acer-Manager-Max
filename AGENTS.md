@@ -92,6 +92,9 @@ Three parts:
   on the next kernel update.
 - The driver's mode-cycling key can put the firmware in Quiet, which isn't one
   of GNOME's three modes.
-- The `damxfix` alias (`~/.bash_aliases`, see `~/modifications/damxfix-alias/`)
-  reinstalls the ORIGINAL DAMX and would undo this fork. Retire it once this
-  install is confirmed working.
+- The old `damxfix` alias was removed 2026-11-26 (see
+  `~/modifications/damxfix-alias/`). `~/workspace/DAMX-1.0.2/` still holds the
+  original installer.
+- README screenshots (`docs/screenshots/`) were taken with the broadway preview
+  against the real service, under `dbus-run-session` so the app's
+  single-instance check doesn't just raise the user's open window.
